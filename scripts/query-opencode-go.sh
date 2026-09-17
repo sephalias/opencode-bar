@@ -258,8 +258,11 @@ fetch_usage_api() {
         -H "Accept: application/json")" || {
         local status="${fetched%% *}"
         local body_file="${fetched#* }"
+        local message
+        message="$(jq -r '.error.message // .message // .error // empty' "$body_file" 2>/dev/null || true)"
         rm -f "$body_file"
-        printf '{"error":"OpenCode Go usage API request failed (HTTP %s)"}' "$status"
+        [[ -n "$message" ]] || message="OpenCode Go usage API request failed (HTTP $status)"
+        jq -n --arg message "$message" '{"error": $message}'
         return 4
     }
 

@@ -98,7 +98,7 @@ final class OpenCodeGoProviderTests: XCTestCase {
         XCTAssertEqual(usage.rolling?.usagePercent ?? -1, 64, accuracy: 0.001)
         XCTAssertNil(usage.weekly)
         XCTAssertNil(usage.monthly)
-        XCTAssertEqual(usage.missingWindowNames, ["weeklyUsage", "monthlyUsage"])
+        XCTAssertEqual(usage.missingWindowNames, ["weekly", "monthly"])
     }
 
     func testUsageAPIParserReadsRollingWeeklyMonthlyWindows() throws {
@@ -142,7 +142,7 @@ final class OpenCodeGoProviderTests: XCTestCase {
 
         XCTAssertNil(usage.rolling)
         XCTAssertEqual(usage.weekly?.usagePercent ?? -1, 8, accuracy: 0.001)
-        XCTAssertEqual(usage.missingWindowNames, ["rollingUsage", "monthlyUsage"])
+        XCTAssertEqual(usage.missingWindowNames, ["rolling", "monthly"])
     }
 
     func testUsageAPIParserThrowsWhenAllWindowsNonOk() {
@@ -151,6 +151,19 @@ final class OpenCodeGoProviderTests: XCTestCase {
         """
         let data = json.data(using: .utf8)!
         XCTAssertThrowsError(try OpenCodeGoProvider.parseUsageAPIJSON(data))
+    }
+
+    func testUsageAPIParserSkipsWindowWithBadPercent() throws {
+        let json = """
+        {"usage":{"rolling":{"status":"ok","percent":true,"resetsAt":"2026-09-17T05:42:46Z"},"weekly":{"status":"ok","percent":8,"resetsAt":"2026-09-21T00:00:00Z"}}}
+        """
+        let data = try XCTUnwrap(json.data(using: .utf8))
+
+        let usage = try OpenCodeGoProvider.parseUsageAPIJSON(data)
+
+        XCTAssertNil(usage.rolling)
+        XCTAssertEqual(usage.weekly?.usagePercent ?? -1, 8, accuracy: 0.001)
+        XCTAssertEqual(usage.missingWindowNames, ["rolling", "monthly"])
     }
 
     func testFetchUsesUsageAPIAndLabelsSource() async throws {

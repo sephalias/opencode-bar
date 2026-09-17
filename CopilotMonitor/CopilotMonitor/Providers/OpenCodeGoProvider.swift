@@ -19,9 +19,9 @@ struct OpenCodeGoUsage: Equatable {
 
     var missingWindowNames: [String] {
         var names: [String] = []
-        if rolling == nil { names.append("rollingUsage") }
-        if weekly == nil { names.append("weeklyUsage") }
-        if monthly == nil { names.append("monthlyUsage") }
+        if rolling == nil { names.append("rolling") }
+        if weekly == nil { names.append("weekly") }
+        if monthly == nil { names.append("monthly") }
         return names
     }
 }
@@ -35,7 +35,7 @@ struct OpenCodeGoDashboardCredentials {
 private struct OpenCodeGoUsageAPIResponse: Decodable {
     struct Window: Decodable {
         let status: String?
-        let percent: Double
+        let percent: Double?
         let resetsAt: String?
 
         enum CodingKeys: String, CodingKey {
@@ -49,15 +49,10 @@ private struct OpenCodeGoUsageAPIResponse: Decodable {
             status = try container.decodeIfPresent(String.self, forKey: .status)
             if let value = try? container.decode(Double.self, forKey: .percent) {
                 percent = value
-            } else if let text = try? container.decode(String.self, forKey: .percent),
-                      let value = Double(text) {
-                percent = value
+            } else if let text = try? container.decode(String.self, forKey: .percent) {
+                percent = Double(text)
             } else {
-                throw DecodingError.dataCorruptedError(
-                    forKey: .percent,
-                    in: container,
-                    debugDescription: "Expected numeric percent"
-                )
+                percent = nil
             }
             resetsAt = try container.decodeIfPresent(String.self, forKey: .resetsAt)
         }
@@ -216,13 +211,13 @@ final class OpenCodeGoProvider: ProviderProtocol {
     }
 
     private static func apiWindow(_ window: OpenCodeGoUsageAPIResponse.Window?) -> OpenCodeGoUsageWindow? {
-        guard let window else { return nil }
+        guard let window, let percent = window.percent else { return nil }
         if let status = window.status, status.lowercased() != "ok" {
             logger.warning("OpenCode Go usage window has non-ok status: \(status, privacy: .public)")
             return nil
         }
         return OpenCodeGoUsageWindow(
-            usagePercent: window.percent,
+            usagePercent: percent,
             resetDate: window.resetsAt.flatMap(APIValueParser.parseDate(from:))
         )
     }
@@ -496,15 +491,20 @@ final class OpenCodeGoProvider: ProviderProtocol {
 
     private static func parseWindow(named fieldName: String, in text: String, now: Date) -> OpenCodeGoUsageWindow? {
         guard let body = captureObjectBody(named: fieldName, in: text),
-              let usagePercent = captureNumber(named: "usagePercent", in: body),
-              let resetInSecondsDouble = captureNumber(named: "resetInSec", in: body) else {
+              let usagePercent = captureNumber(named: "usagePercent", in: body) else {
             return nil
         }
 
-        let resetInSeconds = max(0, Int(resetInSecondsDouble.rounded()))
+        let resetDate: Date?
+        if let resetInSecondsDouble = captureNumber(named: "resetInSec", in: body) {
+            let resetInSeconds = max(0, Int(resetInSecondsDouble.rounded()))
+            resetDate = now.addingTimeInterval(TimeInterval(resetInSeconds))
+        } else {
+            resetDate = nil
+        }
         return OpenCodeGoUsageWindow(
             usagePercent: usagePercent,
-            resetDate: now.addingTimeInterval(TimeInterval(resetInSeconds))
+            resetDate: resetDate
         )
     }
 
