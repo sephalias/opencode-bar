@@ -191,113 +191,64 @@ fetch_usage_api() {
     return "$parse_status"
 }
 
-# Shared usage-window parser for the usage API response.
+# Usage-window parser for the usage API response. Pure jq: no Python needed.
 # Usage: parse_go_windows <file>
 # Prints {"windows": {...}} on success or {"error": ...} on failure.
 parse_go_windows() {
     local path="$1"
-
-    python3 - "$path" <<'PY'
-import datetime as dt
-import json
-import sys
-
-path = sys.argv[1]
-raw = open(path, "r", encoding="utf-8", errors="ignore").read()
-
-fields = {
-    "rolling": "5h",
-    "weekly": "Weekly",
-    "monthly": "Monthly",
+    local filter_file
+    filter_file="$(mktemp)"
+    cat > "$filter_file" <<'JQ'
+def parse_reset:
+  if type != "string" or length == 0 then null
+  else ((. | sub("\\.[0-9]+Z$"; "Z")) | try fromdateiso8601 catch null) as $t
+    | if $t == null then null else {epoch: $t} end
+  end;
+def duration:
+  (. | floor | if . < 0 then 0 else . end) as $s
+  | ($s / 86400 | floor) as $d
+  | (($s % 86400) / 3600 | floor) as $h
+  | (($s % 3600) / 60 | floor) as $m
+  | if $d > 0 then "\($d)d \($h)h"
+    elif $h > 0 then "\($h)h \($m)m"
+    else "\($m)m" end;
+def parse_percent:
+  if type == "boolean" or . == null then null
+  elif type == "number" then .
+  elif type == "string" then (try tonumber catch null)
+  else null end;
+(now | floor) as $now
+| (.usage | select(type == "object")) as $u
+| (["rolling", "weekly", "monthly"] | map(
+    . as $k
+    | ($u[$k] | select(type == "object")) as $e
+    | select($e != null)
+    | select((($e.status | type) != "string") or (($e.status | ascii_downcase) == "ok"))
+    | ($e.percent | parse_percent) as $p
+    | select($p != null)
+    | ($e.resetsAt | parse_reset) as $r
+    | {
+        key: $k,
+        value: {
+          field: $k,
+          label: ({"rolling": "5h", "weekly": "Weekly", "monthly": "Monthly"}[$k]),
+          usage_percent: $p,
+          percent_remaining: ([0, 100 - $p] | max),
+          reset_in_seconds: (if $r == null then null else ([$r.epoch - $now, 0] | max | floor) end),
+          reset_in: (if $r == null then null else ($r.epoch - $now | duration) end),
+          resets_at: $e.resetsAt
+        }
+      }
+  ) | from_entries) as $w
+| if ($w | length) == 0 then {error: "No OpenCode Go usage windows found in API response"} | ., halt_error
+  else {windows: $w} end
+JQ
+    jq -f "$filter_file" "$path"
+    local status=$?
+    rm -f "$filter_file"
+    return "$status"
 }
 
-now = dt.datetime.now(dt.timezone.utc)
-
-def fail(message):
-    print(json.dumps({"error": message}))
-    sys.exit(2)
-
-def duration(seconds):
-    seconds = max(0, int(seconds))
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes = rem // 60
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
-
-def parse_reset(value):
-    if not value or not isinstance(value, str):
-        return None, None
-    text = value.replace("Z", "+00:00")
-    try:
-        reset_at = dt.datetime.fromisoformat(text)
-    except ValueError:
-        return None, None
-    if reset_at.tzinfo is None:
-        reset_at = reset_at.replace(tzinfo=dt.timezone.utc)
-    reset_seconds = int((reset_at - now).total_seconds())
-    return max(0, reset_seconds), reset_at
-
-def window_dict(field, label, usage_percent, reset_seconds, reset_at):
-    if reset_at is None:
-        reset_in = None
-        resets_at = None
-    else:
-        reset_in = duration(reset_seconds)
-        resets_at = reset_at.isoformat().replace("+00:00", "Z")
-    return {
-        "field": field,
-        "label": label,
-        "usage_percent": usage_percent,
-        "percent_remaining": max(0.0, 100.0 - usage_percent),
-        "reset_in_seconds": reset_seconds,
-        "reset_in": reset_in,
-        "resets_at": resets_at,
-    }
-
-def parse_percent(value):
-    # Accept numbers and numeric strings (mirrors the app decoder).
-    # Booleans are rejected: float(True) is 1.0, which would fake a window.
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return None
-
-try:
-    payload = json.loads(raw)
-except json.JSONDecodeError:
-    fail("OpenCode Go usage API returned invalid JSON")
-usage = payload.get("usage") if isinstance(payload, dict) else None
-if not isinstance(usage, dict):
-    fail("No OpenCode Go usage windows found in API response")
-
-windows = {}
-for key, label in fields.items():
-    entry = usage.get(key)
-    if not isinstance(entry, dict):
-        continue
-    if isinstance(entry.get("status"), str) and entry["status"].lower() != "ok":
-        continue
-    usage_percent = parse_percent(entry.get("percent"))
-    if usage_percent is None:
-        continue
-    reset_seconds, reset_at = parse_reset(entry.get("resetsAt"))
-    windows[key] = window_dict(key, label, usage_percent, reset_seconds, reset_at)
-
-if not windows:
-    fail("No OpenCode Go usage windows found in API response")
-print(json.dumps({"windows": windows}, sort_keys=True))
-PY
-}
 print_text_result() {
     local model_count="$1"
     local usage_json="${2:-}"
@@ -364,7 +315,6 @@ main() {
     parse_args "$@"
     require_command curl
     require_command jq
-    require_command python3
 
     load_api_key
 
@@ -401,4 +351,6 @@ main() {
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
