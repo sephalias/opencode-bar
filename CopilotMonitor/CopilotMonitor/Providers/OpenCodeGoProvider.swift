@@ -105,9 +105,10 @@ final class OpenCodeGoProvider: ProviderProtocol {
             credentialSource = "OpenCode Go API (zen/go/v1/usage)"
             logger.info("OpenCode Go usage fetched from API")
         } catch let apiError as ProviderError {
-            if case .authenticationFailed = apiError {
-                throw apiError
-            }
+            // The models endpoint does not strictly validate the key, so an
+            // auth failure here does not prove the key is bad. The dashboard
+            // fallback uses a different credential (browser cookie) and may
+            // still succeed, so always try it before surfacing the error.
             logger.warning("OpenCode Go API usage failed, falling back to dashboard: \(apiError.localizedDescription, privacy: .public)")
             let credentialCandidates = dashboardCandidatesOverride ?? dashboardCredentialCandidates()
             guard !credentialCandidates.isEmpty else {

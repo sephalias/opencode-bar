@@ -199,42 +199,58 @@ final class OpenCodeGoProviderTests: XCTestCase {
         XCTAssertEqual(result.details?.authUsageSummary, "OpenCode Go API (zen/go/v1/usage)")
     }
 
-    func testFetchRethrowsAuthErrorWithoutDashboardFallback() async throws {
+    func testFetchFallsBackToDashboardOnUsageAuthFailure() async throws {
         guard TokenManager.shared.getOpenCodeGoAPIKey() != nil else {
             throw XCTSkip("OpenCode Go API key not available; skipping fetch test.")
         }
 
         let session = makeSession()
-        let provider = OpenCodeGoProvider(tokenManager: .shared, session: session)
-        var dashboardRequestSeen = false
+        let provider = OpenCodeGoProvider(
+            tokenManager: .shared,
+            session: session,
+            dashboardCandidatesOverride: [
+                OpenCodeGoDashboardCredentials(
+                    workspaceID: "wrk_TEST",
+                    authCookie: "test-cookie",
+                    source: "Test Cookies"
+                )
+            ]
+        )
+        let dashboardHTML = """
+        <script>
+        self.__next_f.push([1,"{\\"rollingUsage\\":{\\"usagePercent\\":12,\\"resetInSec\\":3600},\\"weeklyUsage\\":{\\"usagePercent\\":34,\\"resetInSec\\":7200},\\"monthlyUsage\\":{\\"usagePercent\\":56,\\"resetInSec\\":10800}}"])
+        </script>
+        """
 
         MockURLProtocol.requestHandler = { request in
             let url = request.url?.absoluteString ?? ""
-            if url.contains("/workspace/") {
-                dashboardRequestSeen = true
-            }
-            let statusCode = url == "https://opencode.ai/zen/go/v1/usage" ? 401 : 200
-            let body = statusCode == 401
-                ? """
+            let statusCode: Int
+            let body: String
+            if url == "https://opencode.ai/zen/go/v1/usage" {
+                statusCode = 401
+                body = """
                 {"type":"error","error":{"type":"AuthError","message":"Unauthorized"}}
                 """
-                : """
+            } else if url.contains("/workspace/") {
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"), "auth=test-cookie")
+                statusCode = 200
+                body = dashboardHTML
+            } else {
+                statusCode = 200
+                body = """
                 {"data":[{}]}
                 """
+            }
             let response = HTTPURLResponse(url: request.url!, statusCode: statusCode, httpVersion: nil, headerFields: nil)!
             return (response, Data(body.utf8))
         }
 
-        do {
-            _ = try await provider.fetch()
-            XCTFail("Expected authentication failure")
-        } catch let error as ProviderError {
-            guard case .authenticationFailed = error else {
-                XCTFail("Expected authenticationFailed, got \(error)")
-                return
-            }
-        }
-        XCTAssertFalse(dashboardRequestSeen, "Dashboard fallback must not run after an auth failure")
+        let result = try await provider.fetch()
+
+        XCTAssertEqual(result.details?.fiveHourUsage ?? -1, 12, accuracy: 0.001)
+        XCTAssertEqual(result.details?.sevenDayUsage ?? -1, 34, accuracy: 0.001)
+        XCTAssertEqual(result.details?.openCodeGoMonthlyUsage ?? -1, 56, accuracy: 0.001)
+        XCTAssertEqual(result.details?.authUsageSummary, "Test Cookies")
     }
 
     func testFetchChainsApiAndFallbackErrors() async throws {
