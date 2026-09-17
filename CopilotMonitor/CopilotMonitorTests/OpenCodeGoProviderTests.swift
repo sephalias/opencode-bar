@@ -129,7 +129,7 @@ final class OpenCodeGoProviderTests: XCTestCase {
 
         for (statusCode, check) in [
             (401, "authenticationFailed"),
-            (500, "networkError"),
+            (500, "networkError")
         ] as [(Int, String)] {
             let provider = OpenCodeGoProvider(session: session, apiKeyOverride: "test-key")
             SharedMockURLProtocol.requestHandler = { request in
