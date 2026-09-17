@@ -68,6 +68,10 @@ assert_parse_error \
     "empty usage object fails"
 
 assert_parse_error \
+    '{"something":"else"}' \
+    "missing usage key fails with structured error"
+
+assert_parse_error \
     'not json' \
     "invalid JSON fails"
 

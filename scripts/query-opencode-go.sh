@@ -11,6 +11,8 @@
 set -euo pipefail
 
 PROVIDER_ID="opencode-go"
+# Mirrored in OpenCodeGoAPI (Providers/OpenCodeGoProvider.swift).
+# Update both when the endpoint moves.
 MODELS_URL="https://opencode.ai/zen/go/v1/models"
 USAGE_API_URL="https://opencode.ai/zen/go/v1/usage"
 
@@ -136,32 +138,34 @@ load_api_key() {
 }
 http_get_to_file() {
     local url="$1"
-    shift
-    local body_file
-    body_file="$(mktemp)"
+    local dest="$2"
+    shift 2
     local status
     status="$(
-        curl -sS -L -o "$body_file" -w '%{http_code}' "$url" "$@" || true
+        curl -sS -L -o "$dest" -w '%{http_code}' "$url" "$@" || true
     )"
-    printf '%s %s\n' "$status" "$body_file"
+    printf '%s' "$status"
     [[ "$status" =~ ^2 ]]
 }
 
+# Extract a server error message from a JSON failure body.
+json_error_message() {
+    jq -r '.error.message // .message // .error // empty' "$1" 2>/dev/null || true
+}
+
 validate_models_api() {
-    local fetched
-    fetched="$(http_get_to_file "$MODELS_URL" \
+    local body_file
+    body_file="$(mktemp)"
+    local status
+    if ! status="$(http_get_to_file "$MODELS_URL" "$body_file" \
         -H "Authorization: Bearer $API_KEY" \
-        -H "Accept: application/json")" || {
-        local status="${fetched%% *}"
-        local body_file="${fetched#* }"
+        -H "Accept: application/json")"; then
         local message
-        message="$(jq -r '.error.message // .message // .error // empty' "$body_file" 2>/dev/null || true)"
+        message="$(json_error_message "$body_file")"
         rm -f "$body_file"
         [[ -n "$message" ]] || message="HTTP $status from $MODELS_URL"
         fail "OpenCode Go API key validation failed: $message"
-    }
-
-    local body_file="${fetched#* }"
+    fi
 
     local model_count
     model_count="$(jq -r '(.data // .models // []) | length' "$body_file")"
@@ -170,21 +174,20 @@ validate_models_api() {
 }
 
 fetch_usage_api() {
-    local fetched
-    fetched="$(http_get_to_file "$USAGE_API_URL" \
+    local body_file
+    body_file="$(mktemp)"
+    local status
+    if ! status="$(http_get_to_file "$USAGE_API_URL" "$body_file" \
         -H "Authorization: Bearer $API_KEY" \
-        -H "Accept: application/json")" || {
-        local status="${fetched%% *}"
-        local body_file="${fetched#* }"
+        -H "Accept: application/json")"; then
         local message
-        message="$(jq -r '.error.message // .message // .error // empty' "$body_file" 2>/dev/null || true)"
+        message="$(json_error_message "$body_file")"
         rm -f "$body_file"
         [[ -n "$message" ]] || message="OpenCode Go usage API request failed (HTTP $status)"
         jq -n --arg message "$message" '{"error": $message}'
         return 4
-    }
+    fi
 
-    local body_file="${fetched#* }"
     parse_go_windows "$body_file"
     local parse_status=$?
     rm -f "$body_file"
@@ -195,10 +198,7 @@ fetch_usage_api() {
 # Usage: parse_go_windows <file>
 # Prints {"windows": {...}} on success or {"error": ...} on failure.
 parse_go_windows() {
-    local path="$1"
-    local filter_file
-    filter_file="$(mktemp)"
-    cat > "$filter_file" <<'JQ'
+    jq '
 def parse_reset:
   if type != "string" or length == 0 then null
   else ((. | sub("\\.[0-9]+Z$"; "Z")) | try fromdateiso8601 catch null) as $t
@@ -218,35 +218,30 @@ def parse_percent:
   elif type == "string" then (try tonumber catch null)
   else null end;
 (now | floor) as $now
-| (.usage | select(type == "object")) as $u
-| (["rolling", "weekly", "monthly"] | map(
-    . as $k
-    | ($u[$k] | select(type == "object")) as $e
-    | select($e != null)
-    | select((($e.status | type) != "string") or (($e.status | ascii_downcase) == "ok"))
-    | ($e.percent | parse_percent) as $p
-    | select($p != null)
-    | ($e.resetsAt | parse_reset) as $r
-    | {
-        key: $k,
-        value: {
-          field: $k,
-          label: ({"rolling": "5h", "weekly": "Weekly", "monthly": "Monthly"}[$k]),
-          usage_percent: $p,
-          percent_remaining: ([0, 100 - $p] | max),
-          reset_in_seconds: (if $r == null then null else ([$r.epoch - $now, 0] | max | floor) end),
-          reset_in: (if $r == null then null else ($r.epoch - $now | duration) end),
-          resets_at: $e.resetsAt
+| ((.usage | select(type == "object")) // {}) as $u | (["rolling", "weekly", "monthly"] | map(
+      . as $k
+      | ($u[$k] | select(type == "object")) as $e
+      | select($e != null)
+      | select((($e.status | type) != "string") or (($e.status | ascii_downcase) == "ok"))
+      | ($e.percent | parse_percent) as $p
+      | select($p != null)
+      | ($e.resetsAt | parse_reset) as $r
+      | {
+          key: $k,
+          value: {
+            field: $k,
+            label: ({"rolling": "5h", "weekly": "Weekly", "monthly": "Monthly"}[$k]),
+            usage_percent: $p,
+            percent_remaining: ([0, 100 - $p] | max),
+            reset_in_seconds: (if $r == null then null else ([$r.epoch - $now, 0] | max | floor) end),
+            reset_in: (if $r == null then null else ($r.epoch - $now | duration) end),
+            resets_at: $e.resetsAt
+          }
         }
-      }
-  ) | from_entries) as $w
+    ) | from_entries) as $w
 | if ($w | length) == 0 then {error: "No OpenCode Go usage windows found in API response"} | ., halt_error
   else {windows: $w} end
-JQ
-    jq -f "$filter_file" "$path"
-    local status=$?
-    rm -f "$filter_file"
-    return "$status"
+' "$1"
 }
 
 print_text_result() {

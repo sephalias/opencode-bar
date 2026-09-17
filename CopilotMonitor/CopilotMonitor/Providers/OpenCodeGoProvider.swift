@@ -9,20 +9,23 @@ struct OpenCodeGoUsageWindow: Equatable {
 }
 
 struct OpenCodeGoUsage: Equatable {
-    let rolling: OpenCodeGoUsageWindow?
-    let weekly: OpenCodeGoUsageWindow?
-    let monthly: OpenCodeGoUsageWindow?
+    /// Single source of truth for the usage windows, in display order.
+    /// The decode, the accessors, and the missing-window report all derive
+    /// from this list. The diagnostic script mirrors it (see its fields map).
+    static let orderedKeys = ["rolling", "weekly", "monthly"]
+
+    let windows: [String: OpenCodeGoUsageWindow]
+
+    var rolling: OpenCodeGoUsageWindow? { windows["rolling"] }
+    var weekly: OpenCodeGoUsageWindow? { windows["weekly"] }
+    var monthly: OpenCodeGoUsageWindow? { windows["monthly"] }
 
     var usagePercents: [Double] {
-        [rolling?.usagePercent, weekly?.usagePercent, monthly?.usagePercent].compactMap { $0 }
+        Self.orderedKeys.compactMap { windows[$0]?.usagePercent }
     }
 
     var missingWindowNames: [String] {
-        var names: [String] = []
-        if rolling == nil { names.append("rolling") }
-        if weekly == nil { names.append("weekly") }
-        if monthly == nil { names.append("monthly") }
-        return names
+        Self.orderedKeys.filter { windows[$0] == nil }
     }
 }
 
@@ -41,13 +44,7 @@ private struct OpenCodeGoUsageAPIResponse: Decodable {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             status = try container.decodeIfPresent(String.self, forKey: .status)
-            if let value = try? container.decode(Double.self, forKey: .percent) {
-                percent = value
-            } else if let text = try? container.decode(String.self, forKey: .percent) {
-                percent = Double(text)
-            } else {
-                percent = nil
-            }
+            percent = try container.decodeFlexibleDoubleIfPresent(forKey: .percent)
             resetsAt = try container.decodeIfPresent(String.self, forKey: .resetsAt)
         }
     }
@@ -56,6 +53,8 @@ private struct OpenCodeGoUsageAPIResponse: Decodable {
 }
 
 enum OpenCodeGoAPI {
+    // Mirrored in scripts/query-opencode-go.sh (MODELS_URL/USAGE_API_URL).
+    // Update both when the endpoint moves.
     static let modelsURL = URL(string: "https://opencode.ai/zen/go/v1/models")!
     static let usageURL = URL(string: "https://opencode.ai/zen/go/v1/usage")!
     static let usageSourceLabel = "OpenCode Go API (zen/go/v1/usage)"
@@ -74,11 +73,11 @@ final class OpenCodeGoProvider: ProviderProtocol {
     init(
         tokenManager: TokenManager = .shared,
         session: URLSession = .shared,
-        apiKeyOverride: String? = nil
+        apiKey: String? = nil
     ) {
         self.tokenManager = tokenManager
         self.session = session
-        self.apiKeyOverride = apiKeyOverride
+        self.apiKeyOverride = apiKey
     }
 
     func fetch() async throws -> ProviderResult {
@@ -93,12 +92,10 @@ final class OpenCodeGoProvider: ProviderProtocol {
         // The API error propagates with its classification intact so the
         // CLI keeps reporting authentication/network exit codes correctly.
         let usage = try await fetchUsageAPI(apiKey: apiKey)
-        let credentialSource = OpenCodeGoAPI.usageSourceLabel
-        logger.info("OpenCode Go usage fetched from API")
 
         let missingWindowNames = usage.missingWindowNames
         if !missingWindowNames.isEmpty {
-            logger.warning("OpenCode Go usage from \(credentialSource, privacy: .public) missing window(s): \(missingWindowNames.joined(separator: ", "), privacy: .public)")
+            logger.warning("OpenCode Go usage from \(OpenCodeGoAPI.usageSourceLabel, privacy: .public) missing window(s): \(missingWindowNames.joined(separator: ", "), privacy: .public)")
         }
 
         let overallUsed = usage.usagePercents.max() ?? 0
@@ -122,7 +119,7 @@ final class OpenCodeGoProvider: ProviderProtocol {
             openCodeGoMonthlyReset: usage.monthly?.resetDate,
             openCodeGoModelCount: modelCount,
             authSource: authPath,
-            authUsageSummary: credentialSource
+            authUsageSummary: OpenCodeGoAPI.usageSourceLabel
         )
 
         logger.info(
@@ -140,11 +137,12 @@ final class OpenCodeGoProvider: ProviderProtocol {
             throw ProviderError.decodingError("Unexpected OpenCode Go usage response (\(error.localizedDescription))")
         }
 
-        let usage = OpenCodeGoUsage(
-            rolling: apiWindow(response.usage["rolling"]),
-            weekly: apiWindow(response.usage["weekly"]),
-            monthly: apiWindow(response.usage["monthly"])
+        let windows = Dictionary(
+            uniqueKeysWithValues: OpenCodeGoUsage.orderedKeys.compactMap { key in
+                Self.apiWindow(key: key, response.usage[key]).map { (key, $0) }
+            }
         )
+        let usage = OpenCodeGoUsage(windows: windows)
 
         guard !usage.usagePercents.isEmpty else {
             throw ProviderError.decodingError(
@@ -155,35 +153,42 @@ final class OpenCodeGoProvider: ProviderProtocol {
         return usage
     }
 
-    private func fetchUsageAPI(apiKey: String) async throws -> OpenCodeGoUsage {
-        var request = URLRequest(url: OpenCodeGoAPI.usageURL)
+    private static func authorizedRequest(url: URL, apiKey: String) -> URLRequest {
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        return request
+    }
 
-        let data = try await fetchData(request: request)
+    private func fetchUsageAPI(apiKey: String) async throws -> OpenCodeGoUsage {
+        let data = try await fetchData(request: Self.authorizedRequest(url: OpenCodeGoAPI.usageURL, apiKey: apiKey))
         return try Self.parseUsageAPIJSON(data)
     }
 
-    private static func apiWindow(_ window: OpenCodeGoUsageAPIResponse.Window?) -> OpenCodeGoUsageWindow? {
-        guard let window, let percent = window.percent else { return nil }
+    private static func apiWindow(key: String, _ window: OpenCodeGoUsageAPIResponse.Window?) -> OpenCodeGoUsageWindow? {
+        // Absent windows stay silent here; missingWindowNames reports them.
+        guard let window else { return nil }
         if let status = window.status, status.lowercased() != "ok" {
-            logger.warning("OpenCode Go usage window has non-ok status: \(status, privacy: .public)")
+            logger.warning("OpenCode Go usage window has non-ok status: \(key, privacy: .public) status=\(status, privacy: .public)")
             return nil
+        }
+        guard let percent = window.percent else {
+            logger.warning("OpenCode Go usage window has no usable percent: \(key, privacy: .public)")
+            return nil
+        }
+        let resetDate = window.resetsAt.flatMap(APIValueParser.parseDate(from:))
+        if window.resetsAt != nil, resetDate == nil {
+            logger.warning("OpenCode Go usage window has unparseable reset: \(key, privacy: .public)")
         }
         return OpenCodeGoUsageWindow(
             usagePercent: percent,
-            resetDate: window.resetsAt.flatMap(APIValueParser.parseDate(from:))
+            resetDate: resetDate
         )
     }
 
     private func fetchModelCount(apiKey: String) async throws -> Int {
-        var request = URLRequest(url: OpenCodeGoAPI.modelsURL)
-        request.httpMethod = "GET"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        let data = try await fetchData(request: request)
+        let data = try await fetchData(request: Self.authorizedRequest(url: OpenCodeGoAPI.modelsURL, apiKey: apiKey))
         let object = try JSONSerialization.jsonObject(with: data)
 
         if let dictionary = object as? [String: Any] {

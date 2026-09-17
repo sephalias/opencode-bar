@@ -40,12 +40,18 @@ final class OpenCodeGoProviderTests: XCTestCase {
         XCTAssertEqual(usage.missingWindowNames, [])
     }
 
-    func testUsageAPIParserThrowsWhenNoWindows() {
-        let json = """
-        {"usage":{}}
-        """
-        let data = json.data(using: .utf8)!
-        XCTAssertThrowsError(try OpenCodeGoProvider.parseUsageAPIJSON(data))
+    func testUsageAPIParserThrowsWhenNoWindows() throws {
+        for json in [
+            """
+            {"usage":{}}
+            """,
+            """
+            {"usage":{"rolling":{"status":"expired","percent":99,"resetsAt":"2026-09-17T05:42:46Z"}}}
+            """
+        ] {
+            let data = try XCTUnwrap(json.data(using: .utf8))
+            XCTAssertThrowsError(try OpenCodeGoProvider.parseUsageAPIJSON(data))
+        }
     }
 
     func testUsageAPIParserSkipsNonOkWindows() throws {
@@ -59,14 +65,6 @@ final class OpenCodeGoProviderTests: XCTestCase {
         XCTAssertNil(usage.rolling)
         XCTAssertEqual(usage.weekly?.usagePercent ?? -1, 8, accuracy: 0.001)
         XCTAssertEqual(usage.missingWindowNames, ["rolling", "monthly"])
-    }
-
-    func testUsageAPIParserThrowsWhenAllWindowsNonOk() {
-        let json = """
-        {"usage":{"rolling":{"status":"expired","percent":99,"resetsAt":"2026-09-17T05:42:46Z"}}}
-        """
-        let data = json.data(using: .utf8)!
-        XCTAssertThrowsError(try OpenCodeGoProvider.parseUsageAPIJSON(data))
     }
 
     func testUsageAPIParserSkipsWindowWithBadPercent() throws {
@@ -84,7 +82,7 @@ final class OpenCodeGoProviderTests: XCTestCase {
 
     func testFetchUsesUsageAPIAndLabelsSource() async throws {
         let session = makeMockSession()
-        let provider = OpenCodeGoProvider(session: session, apiKeyOverride: "test-key")
+        let provider = OpenCodeGoProvider(session: session, apiKey: "test-key")
         let modelsJSON = """
         {"data":[{},{},{}]}
         """
@@ -131,7 +129,7 @@ final class OpenCodeGoProviderTests: XCTestCase {
             (401, "authenticationFailed"),
             (500, "networkError")
         ] as [(Int, String)] {
-            let provider = OpenCodeGoProvider(session: session, apiKeyOverride: "test-key")
+            let provider = OpenCodeGoProvider(session: session, apiKey: "test-key")
             SharedMockURLProtocol.requestHandler = { request in
                 let url = request.url?.absoluteString ?? ""
                 let code = url == OpenCodeGoAPI.usageURL.absoluteString ? statusCode : 200
