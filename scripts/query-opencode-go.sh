@@ -53,7 +53,7 @@ Config file:
   ~/.config/opencode-bar/opencode-go.json or ~/.config/opencode-quota/opencode-go.json
   with fields: {"workspaceId":"...","authCookie":"..."}
 
-Fallback (only when the usage API is unreachable):
+Fallback (when the usage API request fails for any reason):
   If dashboard config is not set, the script tries to read the opencode.ai
   auth cookie and recent /workspace/<id>/go visits from Chromium browser
   profiles on this Mac.

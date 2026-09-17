@@ -290,7 +290,7 @@ curl -s "https://opencode.ai/zen/go/v1/models" \
 
 OpenCode Go usage comes from the official `GET https://opencode.ai/zen/go/v1/usage` API using the `opencode-go` API key from `auth.json` (`Authorization: Bearer <key>`). It returns `rolling` (5h), `weekly`, and `monthly` windows with `percent` used and `resetsAt` timestamps.
 
-The legacy OpenCode dashboard scrape is kept only as a fallback when the API is unreachable. It reads the dashboard page when both a workspace ID and browser auth cookie are configured:
+The legacy OpenCode dashboard scrape is kept as a fallback when the API request fails. It reads the dashboard page when both a workspace ID and browser auth cookie are configured:
 
 ```json
 {
@@ -312,7 +312,7 @@ Environment overrides:
 
 OpenCode Go is displayed with explicit 5-hour, weekly, and monthly used percentages. The official limits are value-based: 5h `$12`, weekly `$30`, monthly `$60`; the subscription preset is `Go ($10/m)`.
 
-The bundled `scripts/query-opencode-go.sh` validates the API key and prints the usage API windows, falling back to the dashboard scrape when the API is unreachable.
+The bundled `scripts/query-opencode-go.sh` validates the API key and prints the usage API windows, falling back to the dashboard scrape when the API request fails.
 
 ---
 

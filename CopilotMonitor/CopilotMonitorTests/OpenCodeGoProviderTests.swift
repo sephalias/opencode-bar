@@ -101,6 +101,19 @@ final class OpenCodeGoProviderTests: XCTestCase {
         XCTAssertEqual(usage.missingWindowNames, ["weekly", "monthly"])
     }
 
+    func testDashboardUsageParserKeepsWindowWithoutReset() throws {
+        let html = #"""
+        <script>
+        self.__next_f.push([1,"{\"rollingUsage\":{\"usagePercent\":64}}"])
+        </script>
+        """#
+
+        let usage = try OpenCodeGoProvider.parseDashboardUsageHTML(html)
+
+        XCTAssertEqual(usage.rolling?.usagePercent ?? -1, 64, accuracy: 0.001)
+        XCTAssertNil(usage.rolling?.resetDate)
+    }
+
     func testUsageAPIParserReadsRollingWeeklyMonthlyWindows() throws {
         let json = """
         {"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":"2026-09-17T05:42:46.182Z"},"weekly":{"status":"ok","percent":"8","resetsAt":"2026-09-21T00:00:00Z"},"monthly":{"status":"ok","percent":2}}}
