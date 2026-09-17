@@ -74,6 +74,7 @@ final class OpenCodeGoProvider: ProviderProtocol {
 
     private let tokenManager: TokenManager
     private let session: URLSession
+    private let apiKeyOverride: String?
     private let dashboardCandidatesOverride: [OpenCodeGoDashboardCredentials]?
     private let modelsURL = URL(string: "https://opencode.ai/zen/go/v1/models")!
     private let usageURL = URL(string: "https://opencode.ai/zen/go/v1/usage")!
@@ -81,17 +82,19 @@ final class OpenCodeGoProvider: ProviderProtocol {
     init(
         tokenManager: TokenManager = .shared,
         session: URLSession = .shared,
+        apiKeyOverride: String? = nil,
         dashboardCandidatesOverride: [OpenCodeGoDashboardCredentials]? = nil
     ) {
         self.tokenManager = tokenManager
         self.session = session
+        self.apiKeyOverride = apiKeyOverride
         self.dashboardCandidatesOverride = dashboardCandidatesOverride
     }
 
     func fetch() async throws -> ProviderResult {
         logger.info("OpenCode Go fetch started")
 
-        guard let apiKey = tokenManager.getOpenCodeGoAPIKey() else {
+        guard let apiKey = apiKeyOverride ?? tokenManager.getOpenCodeGoAPIKey() else {
             logger.error("OpenCode Go API key not found")
             throw ProviderError.authenticationFailed("OpenCode Go API key not available")
         }

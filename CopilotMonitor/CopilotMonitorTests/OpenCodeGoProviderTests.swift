@@ -154,12 +154,8 @@ final class OpenCodeGoProviderTests: XCTestCase {
     }
 
     func testFetchUsesUsageAPIAndLabelsSource() async throws {
-        guard TokenManager.shared.getOpenCodeGoAPIKey() != nil else {
-            throw XCTSkip("OpenCode Go API key not available; skipping fetch test.")
-        }
-
         let session = makeSession()
-        let provider = OpenCodeGoProvider(tokenManager: .shared, session: session)
+        let provider = OpenCodeGoProvider(session: session, apiKeyOverride: "test-key")
         let modelsJSON = """
         {"data":[{},{},{}]}
         """
@@ -200,14 +196,10 @@ final class OpenCodeGoProviderTests: XCTestCase {
     }
 
     func testFetchFallsBackToDashboardOnUsageAuthFailure() async throws {
-        guard TokenManager.shared.getOpenCodeGoAPIKey() != nil else {
-            throw XCTSkip("OpenCode Go API key not available; skipping fetch test.")
-        }
-
         let session = makeSession()
         let provider = OpenCodeGoProvider(
-            tokenManager: .shared,
             session: session,
+            apiKeyOverride: "test-key",
             dashboardCandidatesOverride: [
                 OpenCodeGoDashboardCredentials(
                     workspaceID: "wrk_TEST",
@@ -254,14 +246,10 @@ final class OpenCodeGoProviderTests: XCTestCase {
     }
 
     func testFetchChainsApiAndFallbackErrors() async throws {
-        guard TokenManager.shared.getOpenCodeGoAPIKey() != nil else {
-            throw XCTSkip("OpenCode Go API key not available; skipping fetch test.")
-        }
-
         let session = makeSession()
         let provider = OpenCodeGoProvider(
-            tokenManager: .shared,
             session: session,
+            apiKeyOverride: "test-key",
             dashboardCandidatesOverride: []
         )
 

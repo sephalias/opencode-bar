@@ -211,24 +211,39 @@ load_dashboard_config() {
     done < <(dashboard_config_candidates)
 }
 
-validate_models_api() {
+# GET a URL into a temp file. Always echoes "<http-status> <body-path>"
+# so the caller can parse success payloads or failure messages, then
+# removes the file. Returns non-zero on non-2xx responses.
+# (Echoing instead of a global: command substitution runs in a subshell,
+# so a global would never reach the caller.)
+http_get_to_file() {
+    local url="$1"
+    shift
     local body_file
     body_file="$(mktemp)"
-
     local status
     status="$(
-        curl -sS -L -o "$body_file" -w '%{http_code}' "$MODELS_URL" \
-            -H "Authorization: Bearer $API_KEY" \
-            -H "Accept: application/json" || true
+        curl -sS -L -o "$body_file" -w '%{http_code}' "$url" "$@" || true
     )"
+    printf '%s %s\n' "$status" "$body_file"
+    [[ "$status" =~ ^2 ]]
+}
 
-    if [[ ! "$status" =~ ^2 ]]; then
+validate_models_api() {
+    local fetched
+    fetched="$(http_get_to_file "$MODELS_URL" \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "Accept: application/json")" || {
+        local status="${fetched%% *}"
+        local body_file="${fetched#* }"
         local message
         message="$(jq -r '.error.message // .message // .error // empty' "$body_file" 2>/dev/null || true)"
         rm -f "$body_file"
         [[ -n "$message" ]] || message="HTTP $status from $MODELS_URL"
         fail "OpenCode Go API key validation failed: $message"
-    fi
+    }
+
+    local body_file="${fetched#* }"
 
     local model_count
     model_count="$(jq -r '(.data // .models // []) | length' "$body_file")"
@@ -237,22 +252,18 @@ validate_models_api() {
 }
 
 fetch_usage_api() {
-    local body_file
-    body_file="$(mktemp)"
-
-    local status
-    status="$(
-        curl -sS -L -o "$body_file" -w '%{http_code}' "$USAGE_API_URL" \
-            -H "Authorization: Bearer $API_KEY" \
-            -H "Accept: application/json" || true
-    )"
-
-    if [[ ! "$status" =~ ^2 ]]; then
+    local fetched
+    fetched="$(http_get_to_file "$USAGE_API_URL" \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "Accept: application/json")" || {
+        local status="${fetched%% *}"
+        local body_file="${fetched#* }"
         rm -f "$body_file"
         printf '{"error":"OpenCode Go usage API request failed (HTTP %s)"}' "$status"
         return 4
-    fi
+    }
 
+    local body_file="${fetched#* }"
     parse_go_windows api "$body_file"
     local parse_status=$?
     rm -f "$body_file"
@@ -391,22 +402,19 @@ fetch_dashboard_usage() {
         cookie_header="$AUTH_COOKIE"
     fi
 
-    local html_file
-    html_file="$(mktemp)"
-
-    local status
-    status="$(
-        curl -sS -L -o "$html_file" -w '%{http_code}' "$dashboard_url" \
-            -H "Accept: text/html,application/xhtml+xml" \
-            -H "Cookie: $cookie_header" \
-            -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" || true
-    )"
-
-    if [[ ! "$status" =~ ^2 ]]; then
+    local fetched
+    fetched="$(http_get_to_file "$dashboard_url" \
+        -H "Accept: text/html,application/xhtml+xml" \
+        -H "Cookie: $cookie_header" \
+        -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")" || {
+        local status="${fetched%% *}"
+        local html_file="${fetched#* }"
         rm -f "$html_file"
         printf '{"error":"OpenCode Go dashboard request failed (HTTP %s)"}' "$status"
         return 4
-    fi
+    }
+
+    local html_file="${fetched#* }"
 
     parse_go_windows dashboard "$html_file"
     local parse_status=$?
