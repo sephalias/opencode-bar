@@ -2,6 +2,47 @@ import XCTest
 @testable import OpenCode_Bar
 
 final class OpenCodeGoProviderTests: XCTestCase {
+    private final class MockURLProtocol: URLProtocol {
+        static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+        override static func canInit(with request: URLRequest) -> Bool {
+            true
+        }
+
+        override static func canonicalRequest(for request: URLRequest) -> URLRequest {
+            request
+        }
+
+        override func startLoading() {
+            guard let handler = MockURLProtocol.requestHandler else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                return
+            }
+
+            do {
+                let (response, data) = try handler(request)
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: data)
+                client?.urlProtocolDidFinishLoading(self)
+            } catch {
+                client?.urlProtocol(self, didFailWithError: error)
+            }
+        }
+
+        override func stopLoading() {}
+    }
+
+    private func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
+    override func tearDown() {
+        MockURLProtocol.requestHandler = nil
+        super.tearDown()
+    }
+
     func testProviderIdentifier() {
         let provider = OpenCodeGoProvider()
         XCTAssertEqual(provider.identifier, .openCodeGo)
@@ -25,7 +66,7 @@ final class OpenCodeGoProviderTests: XCTestCase {
         XCTAssertEqual(usage.rolling?.usagePercent ?? -1, 12.5, accuracy: 0.001)
         XCTAssertEqual(usage.weekly?.usagePercent ?? -1, 25.0, accuracy: 0.001)
         XCTAssertEqual(usage.monthly?.usagePercent ?? -1, 50.0, accuracy: 0.001)
-        XCTAssertEqual(usage.rolling?.resetInSeconds, 3_600)
+        XCTAssertEqual(usage.rolling?.resetDate, now.addingTimeInterval(3_600))
         XCTAssertEqual(usage.weekly?.resetDate, now.addingTimeInterval(7_200))
         XCTAssertEqual(usage.monthly?.resetDate, now.addingTimeInterval(10_800))
     }
@@ -42,7 +83,7 @@ final class OpenCodeGoProviderTests: XCTestCase {
         XCTAssertEqual(usage.rolling?.usagePercent ?? -1, 0, accuracy: 0.001)
         XCTAssertEqual(usage.weekly?.usagePercent ?? -1, 31, accuracy: 0.001)
         XCTAssertEqual(usage.monthly?.usagePercent ?? -1, 21, accuracy: 0.001)
-        XCTAssertEqual(usage.rolling?.resetInSeconds, 18_000)
+        XCTAssertNotNil(usage.rolling?.resetDate)
     }
 
     func testDashboardUsageParserKeepsPartialUsageWindows() throws {
@@ -62,17 +103,24 @@ final class OpenCodeGoProviderTests: XCTestCase {
 
     func testUsageAPIParserReadsRollingWeeklyMonthlyWindows() throws {
         let json = """
-        {"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":"2026-09-17T05:42:46.182Z"},"weekly":{"status":"ok","percent":8,"resetsAt":"2026-09-21T00:00:00.000Z"},"monthly":{"status":"ok","percent":2,"resetsAt":"2026-10-15T12:50:56.000Z"}}}
+        {"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":"2026-09-17T05:42:46.182Z"},"weekly":{"status":"ok","percent":"8","resetsAt":"2026-09-21T00:00:00Z"},"monthly":{"status":"ok","percent":2}}}
         """
         let data = try XCTUnwrap(json.data(using: .utf8))
-        let now = ISO8601DateFormatter().date(from: "2026-09-17T02:00:00Z")!
 
-        let usage = try OpenCodeGoProvider.parseUsageAPIJSON(data, now: now)
+        let usage = try OpenCodeGoProvider.parseUsageAPIJSON(data)
 
         XCTAssertEqual(usage.rolling?.usagePercent ?? -1, 4, accuracy: 0.001)
         XCTAssertEqual(usage.weekly?.usagePercent ?? -1, 8, accuracy: 0.001)
         XCTAssertEqual(usage.monthly?.usagePercent ?? -1, 2, accuracy: 0.001)
-        XCTAssertEqual(usage.rolling?.resetInSeconds, 13_366)
+        XCTAssertEqual(
+            usage.rolling?.resetDate,
+            APIValueParser.parseDate(from: "2026-09-17T05:42:46.182Z")
+        )
+        XCTAssertEqual(
+            usage.weekly?.resetDate,
+            APIValueParser.parseDate(from: "2026-09-21T00:00:00Z")
+        )
+        XCTAssertNil(usage.monthly?.resetDate)
         XCTAssertEqual(usage.missingWindowNames, [])
     }
 
@@ -82,6 +130,146 @@ final class OpenCodeGoProviderTests: XCTestCase {
         """
         let data = json.data(using: .utf8)!
         XCTAssertThrowsError(try OpenCodeGoProvider.parseUsageAPIJSON(data))
+    }
+
+    func testUsageAPIParserSkipsNonOkWindows() throws {
+        let json = """
+        {"usage":{"rolling":{"status":"expired","percent":99,"resetsAt":"2026-09-17T05:42:46Z"},"weekly":{"status":"ok","percent":8,"resetsAt":"2026-09-21T00:00:00Z"}}}
+        """
+        let data = try XCTUnwrap(json.data(using: .utf8))
+
+        let usage = try OpenCodeGoProvider.parseUsageAPIJSON(data)
+
+        XCTAssertNil(usage.rolling)
+        XCTAssertEqual(usage.weekly?.usagePercent ?? -1, 8, accuracy: 0.001)
+        XCTAssertEqual(usage.missingWindowNames, ["rollingUsage", "monthlyUsage"])
+    }
+
+    func testUsageAPIParserThrowsWhenAllWindowsNonOk() {
+        let json = """
+        {"usage":{"rolling":{"status":"expired","percent":99,"resetsAt":"2026-09-17T05:42:46Z"}}}
+        """
+        let data = json.data(using: .utf8)!
+        XCTAssertThrowsError(try OpenCodeGoProvider.parseUsageAPIJSON(data))
+    }
+
+    func testFetchUsesUsageAPIAndLabelsSource() async throws {
+        guard TokenManager.shared.getOpenCodeGoAPIKey() != nil else {
+            throw XCTSkip("OpenCode Go API key not available; skipping fetch test.")
+        }
+
+        let session = makeSession()
+        let provider = OpenCodeGoProvider(tokenManager: .shared, session: session)
+        let modelsJSON = """
+        {"data":[{},{},{}]}
+        """
+        let usageJSON = """
+        {"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":"2026-09-17T05:42:46.182Z"},"weekly":{"status":"ok","percent":8,"resetsAt":"2026-09-21T00:00:00Z"},"monthly":{"status":"ok","percent":2,"resetsAt":"2026-10-15T12:50:56Z"}}}
+        """
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.absoluteString ?? ""
+            XCTAssertTrue((request.value(forHTTPHeaderField: "Authorization") ?? "").hasPrefix("Bearer "))
+            let body: String
+            if url == "https://opencode.ai/zen/go/v1/usage" {
+                body = usageJSON
+            } else {
+                XCTAssertEqual(url, "https://opencode.ai/zen/go/v1/models")
+                body = modelsJSON
+            }
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(body.utf8))
+        }
+
+        let result = try await provider.fetch()
+
+        switch result.usage {
+        case .quotaBased(let remaining, let entitlement, let overagePermitted):
+            XCTAssertEqual(remaining, 92)
+            XCTAssertEqual(entitlement, 100)
+            XCTAssertFalse(overagePermitted)
+        default:
+            XCTFail("Expected quota-based usage")
+        }
+
+        XCTAssertEqual(result.details?.fiveHourUsage ?? -1, 4, accuracy: 0.001)
+        XCTAssertEqual(result.details?.sevenDayUsage ?? -1, 8, accuracy: 0.001)
+        XCTAssertEqual(result.details?.openCodeGoMonthlyUsage ?? -1, 2, accuracy: 0.001)
+        XCTAssertEqual(result.details?.openCodeGoModelCount, 3)
+        XCTAssertEqual(result.details?.authUsageSummary, "OpenCode Go API (zen/go/v1/usage)")
+    }
+
+    func testFetchRethrowsAuthErrorWithoutDashboardFallback() async throws {
+        guard TokenManager.shared.getOpenCodeGoAPIKey() != nil else {
+            throw XCTSkip("OpenCode Go API key not available; skipping fetch test.")
+        }
+
+        let session = makeSession()
+        let provider = OpenCodeGoProvider(tokenManager: .shared, session: session)
+        var dashboardRequestSeen = false
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.absoluteString ?? ""
+            if url.contains("/workspace/") {
+                dashboardRequestSeen = true
+            }
+            let statusCode = url == "https://opencode.ai/zen/go/v1/usage" ? 401 : 200
+            let body = statusCode == 401
+                ? """
+                {"type":"error","error":{"type":"AuthError","message":"Unauthorized"}}
+                """
+                : """
+                {"data":[{}]}
+                """
+            let response = HTTPURLResponse(url: request.url!, statusCode: statusCode, httpVersion: nil, headerFields: nil)!
+            return (response, Data(body.utf8))
+        }
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("Expected authentication failure")
+        } catch let error as ProviderError {
+            guard case .authenticationFailed = error else {
+                XCTFail("Expected authenticationFailed, got \(error)")
+                return
+            }
+        }
+        XCTAssertFalse(dashboardRequestSeen, "Dashboard fallback must not run after an auth failure")
+    }
+
+    func testFetchChainsApiAndFallbackErrors() async throws {
+        guard TokenManager.shared.getOpenCodeGoAPIKey() != nil else {
+            throw XCTSkip("OpenCode Go API key not available; skipping fetch test.")
+        }
+
+        let session = makeSession()
+        let provider = OpenCodeGoProvider(
+            tokenManager: .shared,
+            session: session,
+            dashboardCandidatesOverride: []
+        )
+
+        MockURLProtocol.requestHandler = { request in
+            let url = request.url?.absoluteString ?? ""
+            let statusCode = url == "https://opencode.ai/zen/go/v1/usage" ? 500 : 200
+            let body = statusCode == 500 ? "Internal Server Error" : """
+            {"data":[{}]}
+            """
+            let response = HTTPURLResponse(url: request.url!, statusCode: statusCode, httpVersion: nil, headerFields: nil)!
+            return (response, Data(body.utf8))
+        }
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("Expected provider error")
+        } catch let error as ProviderError {
+            guard case .providerError(let message) = error else {
+                XCTFail("Expected providerError, got \(error)")
+                return
+            }
+            XCTAssertTrue(message.contains("usage API failed"), "API failure must be visible: \(message)")
+            XCTAssertTrue(message.contains("Dashboard fallback"), "Fallback state must be visible: \(message)")
+        }
     }
 
     func testWorkspaceIDExtractionKeepsRecentOrderAndDeduplicates() {

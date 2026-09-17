@@ -5,11 +5,10 @@ private let logger = Logger(subsystem: "com.opencodeproviders", category: "OpenC
 
 struct OpenCodeGoUsageWindow: Equatable {
     let usagePercent: Double
-    let resetInSeconds: Int
-    let resetDate: Date
+    let resetDate: Date?
 }
 
-struct OpenCodeGoDashboardUsage: Equatable {
+struct OpenCodeGoUsage: Equatable {
     let rolling: OpenCodeGoUsageWindow?
     let weekly: OpenCodeGoUsageWindow?
     let monthly: OpenCodeGoUsageWindow?
@@ -27,10 +26,44 @@ struct OpenCodeGoDashboardUsage: Equatable {
     }
 }
 
-private struct OpenCodeGoDashboardCredentials {
+struct OpenCodeGoDashboardCredentials {
     let workspaceID: String
     let authCookie: String
     let source: String
+}
+
+private struct OpenCodeGoUsageAPIResponse: Decodable {
+    struct Window: Decodable {
+        let status: String?
+        let percent: Double
+        let resetsAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case percent
+            case resetsAt
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            status = try container.decodeIfPresent(String.self, forKey: .status)
+            if let value = try? container.decode(Double.self, forKey: .percent) {
+                percent = value
+            } else if let text = try? container.decode(String.self, forKey: .percent),
+                      let value = Double(text) {
+                percent = value
+            } else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .percent,
+                    in: container,
+                    debugDescription: "Expected numeric percent"
+                )
+            }
+            resetsAt = try container.decodeIfPresent(String.self, forKey: .resetsAt)
+        }
+    }
+
+    let usage: [String: Window]
 }
 
 final class OpenCodeGoProvider: ProviderProtocol {
@@ -41,12 +74,18 @@ final class OpenCodeGoProvider: ProviderProtocol {
 
     private let tokenManager: TokenManager
     private let session: URLSession
+    private let dashboardCandidatesOverride: [OpenCodeGoDashboardCredentials]?
     private let modelsURL = URL(string: "https://opencode.ai/zen/go/v1/models")!
     private let usageURL = URL(string: "https://opencode.ai/zen/go/v1/usage")!
 
-    init(tokenManager: TokenManager = .shared, session: URLSession = .shared) {
+    init(
+        tokenManager: TokenManager = .shared,
+        session: URLSession = .shared,
+        dashboardCandidatesOverride: [OpenCodeGoDashboardCredentials]? = nil
+    ) {
         self.tokenManager = tokenManager
         self.session = session
+        self.dashboardCandidatesOverride = dashboardCandidatesOverride
     }
 
     func fetch() async throws -> ProviderResult {
@@ -59,43 +98,43 @@ final class OpenCodeGoProvider: ProviderProtocol {
 
         let modelCount = try await fetchModelCount(apiKey: apiKey)
 
-        let dashboardUsage: OpenCodeGoDashboardUsage
+        let usage: OpenCodeGoUsage
         let credentialSource: String
         do {
-            dashboardUsage = try await fetchUsageAPI(apiKey: apiKey)
+            usage = try await fetchUsageAPI(apiKey: apiKey)
             credentialSource = "OpenCode Go API (zen/go/v1/usage)"
             logger.info("OpenCode Go usage fetched from API")
-        } catch let error as ProviderError {
-            if case .authenticationFailed = error {
-                throw error
+        } catch let apiError as ProviderError {
+            if case .authenticationFailed = apiError {
+                throw apiError
             }
-            logger.warning("OpenCode Go API usage failed, falling back to dashboard: \(error.localizedDescription, privacy: .public)")
-            let credentialCandidates = dashboardCredentialCandidates()
+            logger.warning("OpenCode Go API usage failed, falling back to dashboard: \(apiError.localizedDescription, privacy: .public)")
+            let credentialCandidates = dashboardCandidatesOverride ?? dashboardCredentialCandidates()
             guard !credentialCandidates.isEmpty else {
                 logger.warning("OpenCode Go dashboard usage setup is incomplete")
                 throw ProviderError.providerError(
-                    "OpenCode Go usage request failed (\(error.localizedDescription)). Dashboard fallback also needs setup: log in to opencode.ai in Chrome/Brave/Arc/Edge, visit the Go dashboard once, or set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE."
+                    "OpenCode Go usage API failed (\(apiError.localizedDescription)). Dashboard fallback needs setup: log in to opencode.ai in Chrome/Brave/Arc/Edge, visit the Go dashboard once, or set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE."
                 )
             }
-            (dashboardUsage, credentialSource) = try await fetchFirstDashboardUsage(from: credentialCandidates)
-        }
-        guard !dashboardUsage.usagePercents.isEmpty else {
-            logger.error("OpenCode Go response missing usage windows")
-            throw ProviderError.decodingError(
-                "OpenCode Go usage response contained no usage windows. Please report this issue."
-            )
+            do {
+                (usage, credentialSource) = try await fetchFirstDashboardUsage(from: credentialCandidates)
+            } catch {
+                throw ProviderError.providerError(
+                    "OpenCode Go usage API failed (\(apiError.localizedDescription)). Dashboard fallback also failed (\(error.localizedDescription))."
+                )
+            }
         }
 
-        let missingWindowNames = dashboardUsage.missingWindowNames
+        let missingWindowNames = usage.missingWindowNames
         if !missingWindowNames.isEmpty {
-            logger.warning("OpenCode Go dashboard missing usage window(s): \(missingWindowNames.joined(separator: ", "), privacy: .public)")
+            logger.warning("OpenCode Go usage from \(credentialSource, privacy: .public) missing window(s): \(missingWindowNames.joined(separator: ", "), privacy: .public)")
         }
 
-        let overallUsed = dashboardUsage.usagePercents.max() ?? 0
+        let overallUsed = usage.usagePercents.max() ?? 0
         let aggregateUsedPercent = UsagePercentDisplayFormatter.wholePercent(from: overallUsed)
         let remainingPercent = max(0, 100 - aggregateUsedPercent)
 
-        let usage = ProviderUsage.quotaBased(
+        let quotaUsage = ProviderUsage.quotaBased(
             remaining: remainingPercent,
             entitlement: 100,
             overagePermitted: false
@@ -103,28 +142,28 @@ final class OpenCodeGoProvider: ProviderProtocol {
 
         let authPath = tokenManager.lastFoundAuthPath?.path ?? "~/.local/share/opencode/auth.json"
         let details = DetailedUsage(
-            fiveHourUsage: dashboardUsage.rolling?.usagePercent,
-            fiveHourReset: dashboardUsage.rolling?.resetDate,
-            sevenDayUsage: dashboardUsage.weekly?.usagePercent,
-            sevenDayReset: dashboardUsage.weekly?.resetDate,
+            fiveHourUsage: usage.rolling?.usagePercent,
+            fiveHourReset: usage.rolling?.resetDate,
+            sevenDayUsage: usage.weekly?.usagePercent,
+            sevenDayReset: usage.weekly?.resetDate,
             planType: "Go",
-            openCodeGoMonthlyUsage: dashboardUsage.monthly?.usagePercent,
-            openCodeGoMonthlyReset: dashboardUsage.monthly?.resetDate,
+            openCodeGoMonthlyUsage: usage.monthly?.usagePercent,
+            openCodeGoMonthlyReset: usage.monthly?.resetDate,
             openCodeGoModelCount: modelCount,
             authSource: authPath,
             authUsageSummary: credentialSource
         )
 
         logger.info(
-            "OpenCode Go usage fetched: 5h=\(dashboardUsage.rolling?.usagePercent.description ?? "n/a", privacy: .public)%, weekly=\(dashboardUsage.weekly?.usagePercent.description ?? "n/a", privacy: .public)%, monthly=\(dashboardUsage.monthly?.usagePercent.description ?? "n/a", privacy: .public)%"
+            "OpenCode Go usage fetched: 5h=\(usage.rolling?.usagePercent.description ?? "n/a", privacy: .public)%, weekly=\(usage.weekly?.usagePercent.description ?? "n/a", privacy: .public)%, monthly=\(usage.monthly?.usagePercent.description ?? "n/a", privacy: .public)%"
         )
 
-        return ProviderResult(usage: usage, details: details)
+        return ProviderResult(usage: quotaUsage, details: details)
     }
 
-    static func parseDashboardUsageHTML(_ html: String, now: Date = Date()) throws -> OpenCodeGoDashboardUsage {
+    static func parseDashboardUsageHTML(_ html: String, now: Date = Date()) throws -> OpenCodeGoUsage {
         let text = normalizedDashboardHTML(html)
-        let usage = OpenCodeGoDashboardUsage(
+        let usage = OpenCodeGoUsage(
             rolling: parseWindow(named: "rollingUsage", in: text, now: now),
             weekly: parseWindow(named: "weeklyUsage", in: text, now: now),
             monthly: parseWindow(named: "monthlyUsage", in: text, now: now)
@@ -139,16 +178,18 @@ final class OpenCodeGoProvider: ProviderProtocol {
         return usage
     }
 
-    static func parseUsageAPIJSON(_ data: Data, now: Date = Date()) throws -> OpenCodeGoDashboardUsage {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let usageDict = object["usage"] as? [String: Any] else {
-            throw ProviderError.decodingError("Unexpected OpenCode Go usage response")
+    static func parseUsageAPIJSON(_ data: Data) throws -> OpenCodeGoUsage {
+        let response: OpenCodeGoUsageAPIResponse
+        do {
+            response = try JSONDecoder().decode(OpenCodeGoUsageAPIResponse.self, from: data)
+        } catch {
+            throw ProviderError.decodingError("Unexpected OpenCode Go usage response (\(error.localizedDescription))")
         }
 
-        let usage = OpenCodeGoDashboardUsage(
-            rolling: parseAPIWindow(usageDict["rolling"], now: now),
-            weekly: parseAPIWindow(usageDict["weekly"], now: now),
-            monthly: parseAPIWindow(usageDict["monthly"], now: now)
+        let usage = OpenCodeGoUsage(
+            rolling: apiWindow(response.usage["rolling"]),
+            weekly: apiWindow(response.usage["weekly"]),
+            monthly: apiWindow(response.usage["monthly"])
         )
 
         guard !usage.usagePercents.isEmpty else {
@@ -160,7 +201,7 @@ final class OpenCodeGoProvider: ProviderProtocol {
         return usage
     }
 
-    private func fetchUsageAPI(apiKey: String) async throws -> OpenCodeGoDashboardUsage {
+    private func fetchUsageAPI(apiKey: String) async throws -> OpenCodeGoUsage {
         var request = URLRequest(url: usageURL)
         request.httpMethod = "GET"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -170,48 +211,16 @@ final class OpenCodeGoProvider: ProviderProtocol {
         return try Self.parseUsageAPIJSON(data)
     }
 
-    private static func parseAPIWindow(_ value: Any?, now: Date) -> OpenCodeGoUsageWindow? {
-        guard let dict = value as? [String: Any],
-              let percent = numberAsDouble(dict["percent"]) else {
+    private static func apiWindow(_ window: OpenCodeGoUsageAPIResponse.Window?) -> OpenCodeGoUsageWindow? {
+        guard let window else { return nil }
+        if let status = window.status, status.lowercased() != "ok" {
+            logger.warning("OpenCode Go usage window has non-ok status: \(status, privacy: .public)")
             return nil
         }
-
-        let resetDate: Date
-        let resetInSeconds: Int
-        if let resetsAtString = dict["resetsAt"] as? String,
-           let resetsAt = parseISO8601(resetsAtString) {
-            resetDate = resetsAt
-            resetInSeconds = max(0, Int(resetsAt.timeIntervalSince(now).rounded()))
-        } else {
-            return nil
-        }
-
         return OpenCodeGoUsageWindow(
-            usagePercent: percent,
-            resetInSeconds: resetInSeconds,
-            resetDate: resetDate
+            usagePercent: window.percent,
+            resetDate: window.resetsAt.flatMap(APIValueParser.parseDate(from:))
         )
-    }
-
-    private static func numberAsDouble(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber {
-            return number.doubleValue
-        }
-        if let string = value as? String {
-            return Double(string)
-        }
-        return nil
-    }
-
-    private static func parseISO8601(_ string: String) -> Date? {
-        let withFractional = ISO8601DateFormatter()
-        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFractional.date(from: string) {
-            return date
-        }
-        let withoutFractional = ISO8601DateFormatter()
-        withoutFractional.formatOptions = [.withInternetDateTime]
-        return withoutFractional.date(from: string)
     }
 
     private func fetchModelCount(apiKey: String) async throws -> Int {
@@ -239,7 +248,7 @@ final class OpenCodeGoProvider: ProviderProtocol {
         throw ProviderError.decodingError("Unexpected OpenCode Go models response")
     }
 
-    private func fetchDashboardUsage(credentials: OpenCodeGoDashboardCredentials) async throws -> OpenCodeGoDashboardUsage {
+    private func fetchDashboardUsage(credentials: OpenCodeGoDashboardCredentials) async throws -> OpenCodeGoUsage {
         guard let url = URL(string: "https://opencode.ai/workspace/\(credentials.workspaceID)/go") else {
             throw ProviderError.networkError("Invalid OpenCode Go workspace URL")
         }
@@ -263,7 +272,7 @@ final class OpenCodeGoProvider: ProviderProtocol {
 
     private func fetchFirstDashboardUsage(
         from candidates: [OpenCodeGoDashboardCredentials]
-    ) async throws -> (OpenCodeGoDashboardUsage, String) {
+    ) async throws -> (OpenCodeGoUsage, String) {
         var lastError: Error?
 
         for credentials in candidates {
@@ -491,7 +500,6 @@ final class OpenCodeGoProvider: ProviderProtocol {
         let resetInSeconds = max(0, Int(resetInSecondsDouble.rounded()))
         return OpenCodeGoUsageWindow(
             usagePercent: usagePercent,
-            resetInSeconds: resetInSeconds,
             resetDate: now.addingTimeInterval(TimeInterval(resetInSeconds))
         )
     }

@@ -53,7 +53,7 @@ Config file:
   ~/.config/opencode-bar/opencode-go.json or ~/.config/opencode-quota/opencode-go.json
   with fields: {"workspaceId":"...","authCookie":"..."}
 
-Fallback:
+Fallback (only when the usage API is unreachable):
   If dashboard config is not set, the script tries to read the opencode.ai
   auth cookie and recent /workspace/<id>/go visits from Chromium browser
   profiles on this Mac.
@@ -249,26 +249,32 @@ fetch_usage_api() {
 
     if [[ ! "$status" =~ ^2 ]]; then
         rm -f "$body_file"
+        printf '{"error":"OpenCode Go usage API request failed (HTTP %s)"}' "$status"
         return 4
     fi
 
-    python3 - "$body_file" <<'PY'
+    parse_go_windows api "$body_file"
+    local parse_status=$?
+    rm -f "$body_file"
+    return "$parse_status"
+}
+
+# Shared usage-window parser for both sources.
+# Usage: parse_go_windows api|dashboard <file>
+# Prints {"windows": {...}} on success or {"error": ...} on failure.
+parse_go_windows() {
+    local mode="$1"
+    local path="$2"
+
+    python3 - "$mode" "$path" <<'PY'
 import datetime as dt
+import html
 import json
+import re
 import sys
 
-path = sys.argv[1]
+mode, path = sys.argv[1], sys.argv[2]
 raw = open(path, "r", encoding="utf-8", errors="ignore").read()
-try:
-    payload = json.loads(raw)
-except json.JSONDecodeError:
-    print(json.dumps({"error": "OpenCode Go usage API returned invalid JSON"}))
-    sys.exit(2)
-
-usage = payload.get("usage") if isinstance(payload, dict) else None
-if not isinstance(usage, dict):
-    print(json.dumps({"error": "No OpenCode Go usage windows found in API response"}))
-    sys.exit(2)
 
 fields = {
     "rolling": ("rollingUsage", "5h"),
@@ -276,8 +282,12 @@ fields = {
     "monthly": ("monthlyUsage", "Monthly"),
 }
 
+number = r'"?(-?\d+(?:\.\d+)?)"?'
 now = dt.datetime.now(dt.timezone.utc)
-windows = {}
+
+def fail(message):
+    print(json.dumps({"error": message}))
+    sys.exit(2)
 
 def duration(seconds):
     seconds = max(0, int(seconds))
@@ -303,37 +313,72 @@ def parse_reset(value):
     reset_seconds = int((reset_at - now).total_seconds())
     return max(0, reset_seconds), reset_at
 
-for key, (field, label) in fields.items():
-    entry = usage.get(key)
-    if not isinstance(entry, dict):
-        continue
-    try:
-        usage_percent = float(entry.get("percent"))
-    except (TypeError, ValueError):
-        continue
-    reset_seconds, reset_at = parse_reset(entry.get("resetsAt"))
+def emit(windows):
+    if not windows:
+        source = "API response" if mode == "api" else "dashboard HTML"
+        fail(f"No OpenCode Go usage windows found in {source}")
+    print(json.dumps({"windows": windows}, sort_keys=True))
+
+def window_dict(field, label, usage_percent, reset_seconds, reset_at):
     if reset_at is None:
-        continue
-    windows[key] = {
+        reset_in = None
+        resets_at = None
+    else:
+        reset_in = duration(reset_seconds)
+        resets_at = reset_at.isoformat().replace("+00:00", "Z")
+    return {
         "field": field,
         "label": label,
         "usage_percent": usage_percent,
         "percent_remaining": max(0.0, 100.0 - usage_percent),
         "reset_in_seconds": reset_seconds,
-        "reset_in": duration(reset_seconds),
-        "resets_at": reset_at.isoformat().replace("+00:00", "Z"),
+        "reset_in": reset_in,
+        "resets_at": resets_at,
     }
 
-if not windows:
-    print(json.dumps({"error": "No OpenCode Go usage windows found in API response"}))
-    sys.exit(2)
+windows = {}
 
-print(json.dumps({"windows": windows}, sort_keys=True))
+if mode == "api":
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        fail("OpenCode Go usage API returned invalid JSON")
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        fail("No OpenCode Go usage windows found in API response")
+    for key, (field, label) in fields.items():
+        entry = usage.get(key)
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("status"), str) and entry["status"].lower() != "ok":
+            continue
+        try:
+            usage_percent = float(entry.get("percent"))
+        except (TypeError, ValueError):
+            continue
+        reset_seconds, reset_at = parse_reset(entry.get("resetsAt"))
+        windows[key] = window_dict(field, label, usage_percent, reset_seconds, reset_at)
+else:
+    text = html.unescape(raw).replace('\\"', '"')
+    for key, (field, label) in fields.items():
+        object_match = re.search(rf'["\']?{re.escape(field)}["\']?\s*:\s*(?:\$R\[\d+\]\s*=\s*)?\{{(?P<body>[^{{}}]*)\}}', text, re.DOTALL)
+        if not object_match:
+            continue
+        body = object_match.group("body")
+        usage_match = re.search(rf'["\']?usagePercent["\']?\s*:\s*{number}', body)
+        reset_match = re.search(rf'["\']?resetInSec["\']?\s*:\s*{number}', body)
+        if not usage_match:
+            continue
+        usage_percent = float(usage_match.group(1))
+        if reset_match:
+            reset_seconds = int(float(reset_match.group(1)))
+            reset_at = now + dt.timedelta(seconds=reset_seconds)
+        else:
+            reset_seconds, reset_at = None, None
+        windows[key] = window_dict(field, label, usage_percent, reset_seconds, reset_at)
+
+emit(windows)
 PY
-
-    local parse_status=$?
-    rm -f "$body_file"
-    return "$parse_status"
 }
 
 fetch_dashboard_usage() {
@@ -359,72 +404,11 @@ fetch_dashboard_usage() {
 
     if [[ ! "$status" =~ ^2 ]]; then
         rm -f "$html_file"
+        printf '{"error":"OpenCode Go dashboard request failed (HTTP %s)"}' "$status"
         return 4
     fi
 
-    python3 - "$html_file" <<'PY'
-import datetime as dt
-import html
-import json
-import re
-import sys
-
-path = sys.argv[1]
-raw = open(path, "r", encoding="utf-8", errors="ignore").read()
-text = html.unescape(raw).replace('\\"', '"')
-
-fields = {
-    "rolling": ("rollingUsage", "5h"),
-    "weekly": ("weeklyUsage", "Weekly"),
-    "monthly": ("monthlyUsage", "Monthly"),
-}
-
-number = r'"?(-?\d+(?:\.\d+)?)"?'
-now = dt.datetime.now(dt.timezone.utc)
-windows = {}
-
-def duration(seconds):
-    seconds = max(0, int(seconds))
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes = rem // 60
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
-
-for key, (field, label) in fields.items():
-    object_match = re.search(rf'["\']?{re.escape(field)}["\']?\s*:\s*(?:\$R\[\d+\]\s*=\s*)?\{{(?P<body>[^{{}}]*)\}}', text, re.DOTALL)
-    if not object_match:
-        continue
-
-    body = object_match.group("body")
-    usage_match = re.search(rf'["\']?usagePercent["\']?\s*:\s*{number}', body)
-    reset_match = re.search(rf'["\']?resetInSec["\']?\s*:\s*{number}', body)
-    if not usage_match or not reset_match:
-        continue
-
-    usage_percent = float(usage_match.group(1))
-    reset_seconds = int(float(reset_match.group(1)))
-    reset_at = now + dt.timedelta(seconds=reset_seconds)
-    windows[key] = {
-        "field": field,
-        "label": label,
-        "usage_percent": usage_percent,
-        "percent_remaining": max(0.0, 100.0 - usage_percent),
-        "reset_in_seconds": reset_seconds,
-        "reset_in": duration(reset_seconds),
-        "resets_at": reset_at.isoformat().replace("+00:00", "Z"),
-    }
-
-if not windows:
-    print(json.dumps({"error": "No OpenCode Go usage windows found in dashboard HTML"}))
-    sys.exit(2)
-
-print(json.dumps({"windows": windows}, sort_keys=True))
-PY
-
+    parse_go_windows dashboard "$html_file"
     local parse_status=$?
     rm -f "$html_file"
     return "$parse_status"
@@ -704,9 +688,8 @@ print_text_result() {
         if [[ -n "$usage_error" ]]; then
             echo "Reason: $usage_error"
         else
-            echo "Reason: dashboard usage requires a browser login/history match, OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE, or ~/.config/opencode-bar/opencode-go.json."
+            echo "Reason: usage API failed and dashboard fallback requires a browser login/history match, OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE, or ~/.config/opencode-bar/opencode-go.json."
         fi
-        echo "Note: no public API-key-only usage endpoint was found for OpenCode Go."
         return
     fi
 
@@ -717,7 +700,7 @@ print_text_result() {
         def pct: ((. * 100 | round) / 100 | tostring);
         .windows
         | to_entries[]
-        | "\(.value.label): \(.value.usage_percent | pct)% used, \(.value.percent_remaining | pct)% left, resets in \(.value.reset_in) (\(.value.resets_at))"
+        | "\(.value.label): \(.value.usage_percent | pct)% used, \(.value.percent_remaining | pct)% left, resets in \(.value.reset_in // "unknown") (\(.value.resets_at // "unknown"))"
     '
 }
 
@@ -775,29 +758,40 @@ main() {
 
     local usage_json=""
     local usage_error=""
-    if usage_json="$(fetch_usage_api)"; then
+    local api_output=""
+    local api_status=0
+    local api_error=""
+    if api_output="$(fetch_usage_api)"; then
+        usage_json="$api_output"
         USAGE_CONFIG_SOURCE="OpenCode Go API (zen/go/v1/usage)"
-    elif usage_json="$(fetch_dashboard_usage)"; then
-        :
     else
-        local status=$?
-        if usage_json="$(fetch_browser_dashboard_usage)"; then
+        api_status=$?
+        api_error="$(jq -r '.error // empty' <<<"$api_output" 2>/dev/null || true)"
+        [[ -n "$api_error" ]] || api_error="usage API request failed (exit $api_status)"
+        if usage_json="$(fetch_dashboard_usage)"; then
             :
         else
-            local browser_status=$?
-            case "$status:$browser_status" in
-                3:3)
-                    usage_error="Dashboard usage requires a browser login/history match, OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE, or ~/.config/opencode-bar/opencode-go.json."
-                    ;;
-                4:3|4:4)
-                    usage_error="Dashboard request failed. Check workspace ID and auth cookie, or log in to opencode.ai and visit the Go dashboard once."
-                    ;;
-                *)
-                    usage_error="$(printf '%s' "$usage_json" | jq -r '.error // "Dashboard usage parsing failed."' 2>/dev/null || true)"
-                    [[ -n "$usage_error" ]] || usage_error="Dashboard usage parsing failed."
-                    ;;
-            esac
-            usage_json=""
+            local dashboard_status=$?
+            if usage_json="$(fetch_browser_dashboard_usage)"; then
+                :
+            else
+                local browser_status=$?
+                case "$dashboard_status:$browser_status" in
+                    3:3)
+                        usage_error="Usage API failed: $api_error. Dashboard fallback also needs setup: a browser login/history match, OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE, or ~/.config/opencode-bar/opencode-go.json."
+                        ;;
+                    4:3|4:4)
+                        usage_error="Usage API failed: $api_error. Dashboard fallback request failed too. Check workspace ID and auth cookie, or log in to opencode.ai and visit the Go dashboard once."
+                        ;;
+                    *)
+                        local dashboard_error
+                        dashboard_error="$(printf '%s' "$usage_json" | jq -r '.error // empty' 2>/dev/null || true)"
+                        [[ -n "$dashboard_error" ]] || dashboard_error="dashboard usage parsing failed"
+                        usage_error="Usage API failed: $api_error. Dashboard fallback failed: $dashboard_error."
+                        ;;
+                esac
+                usage_json=""
+            fi
         fi
     fi
 
