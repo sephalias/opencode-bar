@@ -4,15 +4,17 @@
 # OpenCode stores the Go model API key in the OpenCode data auth file under:
 #   ~/.local/share/opencode/auth.json -> ["opencode-go"].key
 #
-# The key validates access to the OpenCode Go model API. Usage windows are
-# exposed by the web dashboard. This script first uses explicit dashboard
-# config, then falls back to Chromium browser auth cookies and workspace
-# history from Chrome, Brave, Arc, or Edge.
+# The key validates access to the OpenCode Go model API. Usage windows come
+# from the official usage API (https://opencode.ai/zen/go/v1/usage) with the
+# same API key. The dashboard scrape is kept as a fallback: this script then
+# uses explicit dashboard config, then Chromium browser auth cookies and
+# workspace history from Chrome, Brave, Arc, or Edge.
 
 set -euo pipefail
 
 PROVIDER_ID="opencode-go"
 MODELS_URL="https://opencode.ai/zen/go/v1/models"
+USAGE_API_URL="https://opencode.ai/zen/go/v1/usage"
 DASHBOARD_BASE_URL="https://opencode.ai/workspace"
 
 JSON_OUTPUT=false
@@ -232,6 +234,106 @@ validate_models_api() {
     model_count="$(jq -r '(.data // .models // []) | length' "$body_file")"
     rm -f "$body_file"
     printf '%s\n' "$model_count"
+}
+
+fetch_usage_api() {
+    local body_file
+    body_file="$(mktemp)"
+
+    local status
+    status="$(
+        curl -sS -L -o "$body_file" -w '%{http_code}' "$USAGE_API_URL" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/json" || true
+    )"
+
+    if [[ ! "$status" =~ ^2 ]]; then
+        rm -f "$body_file"
+        return 4
+    fi
+
+    python3 - "$body_file" <<'PY'
+import datetime as dt
+import json
+import sys
+
+path = sys.argv[1]
+raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError:
+    print(json.dumps({"error": "OpenCode Go usage API returned invalid JSON"}))
+    sys.exit(2)
+
+usage = payload.get("usage") if isinstance(payload, dict) else None
+if not isinstance(usage, dict):
+    print(json.dumps({"error": "No OpenCode Go usage windows found in API response"}))
+    sys.exit(2)
+
+fields = {
+    "rolling": ("rollingUsage", "5h"),
+    "weekly": ("weeklyUsage", "Weekly"),
+    "monthly": ("monthlyUsage", "Monthly"),
+}
+
+now = dt.datetime.now(dt.timezone.utc)
+windows = {}
+
+def duration(seconds):
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+def parse_reset(value):
+    if not value or not isinstance(value, str):
+        return None, None
+    text = value.replace("Z", "+00:00")
+    try:
+        reset_at = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None, None
+    if reset_at.tzinfo is None:
+        reset_at = reset_at.replace(tzinfo=dt.timezone.utc)
+    reset_seconds = int((reset_at - now).total_seconds())
+    return max(0, reset_seconds), reset_at
+
+for key, (field, label) in fields.items():
+    entry = usage.get(key)
+    if not isinstance(entry, dict):
+        continue
+    try:
+        usage_percent = float(entry.get("percent"))
+    except (TypeError, ValueError):
+        continue
+    reset_seconds, reset_at = parse_reset(entry.get("resetsAt"))
+    if reset_at is None:
+        continue
+    windows[key] = {
+        "field": field,
+        "label": label,
+        "usage_percent": usage_percent,
+        "percent_remaining": max(0.0, 100.0 - usage_percent),
+        "reset_in_seconds": reset_seconds,
+        "reset_in": duration(reset_seconds),
+        "resets_at": reset_at.isoformat().replace("+00:00", "Z"),
+    }
+
+if not windows:
+    print(json.dumps({"error": "No OpenCode Go usage windows found in API response"}))
+    sys.exit(2)
+
+print(json.dumps({"windows": windows}, sort_keys=True))
+PY
+
+    local parse_status=$?
+    rm -f "$body_file"
+    return "$parse_status"
 }
 
 fetch_dashboard_usage() {
@@ -673,7 +775,9 @@ main() {
 
     local usage_json=""
     local usage_error=""
-    if usage_json="$(fetch_dashboard_usage)"; then
+    if usage_json="$(fetch_usage_api)"; then
+        USAGE_CONFIG_SOURCE="OpenCode Go API (zen/go/v1/usage)"
+    elif usage_json="$(fetch_dashboard_usage)"; then
         :
     else
         local status=$?

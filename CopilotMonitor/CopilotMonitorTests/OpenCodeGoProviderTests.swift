@@ -60,6 +60,30 @@ final class OpenCodeGoProviderTests: XCTestCase {
         XCTAssertEqual(usage.missingWindowNames, ["weeklyUsage", "monthlyUsage"])
     }
 
+    func testUsageAPIParserReadsRollingWeeklyMonthlyWindows() throws {
+        let json = """
+        {"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":"2026-09-17T05:42:46.182Z"},"weekly":{"status":"ok","percent":8,"resetsAt":"2026-09-21T00:00:00.000Z"},"monthly":{"status":"ok","percent":2,"resetsAt":"2026-10-15T12:50:56.000Z"}}}
+        """
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        let now = ISO8601DateFormatter().date(from: "2026-09-17T02:00:00Z")!
+
+        let usage = try OpenCodeGoProvider.parseUsageAPIJSON(data, now: now)
+
+        XCTAssertEqual(usage.rolling?.usagePercent ?? -1, 4, accuracy: 0.001)
+        XCTAssertEqual(usage.weekly?.usagePercent ?? -1, 8, accuracy: 0.001)
+        XCTAssertEqual(usage.monthly?.usagePercent ?? -1, 2, accuracy: 0.001)
+        XCTAssertEqual(usage.rolling?.resetInSeconds, 13_366)
+        XCTAssertEqual(usage.missingWindowNames, [])
+    }
+
+    func testUsageAPIParserThrowsWhenNoWindows() {
+        let json = """
+        {"usage":{}}
+        """
+        let data = json.data(using: .utf8)!
+        XCTAssertThrowsError(try OpenCodeGoProvider.parseUsageAPIJSON(data))
+    }
+
     func testWorkspaceIDExtractionKeepsRecentOrderAndDeduplicates() {
         let urls = [
             "https://opencode.ai/workspace/wrk_01ABCDEF0123456789ABCDEFG/go",

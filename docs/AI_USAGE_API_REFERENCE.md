@@ -288,7 +288,9 @@ curl -s "https://opencode.ai/zen/go/v1/models" \
   -H "Accept: application/json"
 ```
 
-OpenCode Go usage is currently exposed through the OpenCode dashboard. OpenCode Bar reads the dashboard page when both a workspace ID and browser auth cookie are configured:
+OpenCode Go usage comes from the official `GET https://opencode.ai/zen/go/v1/usage` API using the `opencode-go` API key from `auth.json` (`Authorization: Bearer <key>`). It returns `rolling` (5h), `weekly`, and `monthly` windows with `percent` used and `resetsAt` timestamps.
+
+The legacy OpenCode dashboard scrape is kept only as a fallback when the API is unreachable. It reads the dashboard page when both a workspace ID and browser auth cookie are configured:
 
 ```json
 {

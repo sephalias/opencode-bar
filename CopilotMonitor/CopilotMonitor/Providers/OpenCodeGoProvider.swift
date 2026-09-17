@@ -42,6 +42,7 @@ final class OpenCodeGoProvider: ProviderProtocol {
     private let tokenManager: TokenManager
     private let session: URLSession
     private let modelsURL = URL(string: "https://opencode.ai/zen/go/v1/models")!
+    private let usageURL = URL(string: "https://opencode.ai/zen/go/v1/usage")!
 
     init(tokenManager: TokenManager = .shared, session: URLSession = .shared) {
         self.tokenManager = tokenManager
@@ -58,19 +59,30 @@ final class OpenCodeGoProvider: ProviderProtocol {
 
         let modelCount = try await fetchModelCount(apiKey: apiKey)
 
-        let credentialCandidates = dashboardCredentialCandidates()
-        guard !credentialCandidates.isEmpty else {
-            logger.warning("OpenCode Go dashboard usage setup is incomplete")
-            throw ProviderError.providerError(
-                "OpenCode Go dashboard usage setup is incomplete. Log in to opencode.ai in Chrome/Brave/Arc/Edge, visit the Go dashboard once, or set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE."
-            )
+        let dashboardUsage: OpenCodeGoDashboardUsage
+        let credentialSource: String
+        do {
+            dashboardUsage = try await fetchUsageAPI(apiKey: apiKey)
+            credentialSource = "OpenCode Go API (zen/go/v1/usage)"
+            logger.info("OpenCode Go usage fetched from API")
+        } catch let error as ProviderError {
+            if case .authenticationFailed = error {
+                throw error
+            }
+            logger.warning("OpenCode Go API usage failed, falling back to dashboard: \(error.localizedDescription, privacy: .public)")
+            let credentialCandidates = dashboardCredentialCandidates()
+            guard !credentialCandidates.isEmpty else {
+                logger.warning("OpenCode Go dashboard usage setup is incomplete")
+                throw ProviderError.providerError(
+                    "OpenCode Go usage request failed (\(error.localizedDescription)). Dashboard fallback also needs setup: log in to opencode.ai in Chrome/Brave/Arc/Edge, visit the Go dashboard once, or set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE."
+                )
+            }
+            (dashboardUsage, credentialSource) = try await fetchFirstDashboardUsage(from: credentialCandidates)
         }
-
-        let (dashboardUsage, credentialSource) = try await fetchFirstDashboardUsage(from: credentialCandidates)
         guard !dashboardUsage.usagePercents.isEmpty else {
-            logger.error("OpenCode Go dashboard response missing usage windows")
+            logger.error("OpenCode Go response missing usage windows")
             throw ProviderError.decodingError(
-                "OpenCode Go dashboard markup may have changed. No usage windows were found. Please report this issue."
+                "OpenCode Go usage response contained no usage windows. Please report this issue."
             )
         }
 
@@ -125,6 +137,81 @@ final class OpenCodeGoProvider: ProviderProtocol {
         }
 
         return usage
+    }
+
+    static func parseUsageAPIJSON(_ data: Data, now: Date = Date()) throws -> OpenCodeGoDashboardUsage {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usageDict = object["usage"] as? [String: Any] else {
+            throw ProviderError.decodingError("Unexpected OpenCode Go usage response")
+        }
+
+        let usage = OpenCodeGoDashboardUsage(
+            rolling: parseAPIWindow(usageDict["rolling"], now: now),
+            weekly: parseAPIWindow(usageDict["weekly"], now: now),
+            monthly: parseAPIWindow(usageDict["monthly"], now: now)
+        )
+
+        guard !usage.usagePercents.isEmpty else {
+            throw ProviderError.decodingError(
+                "OpenCode Go usage response contained no usage windows. Please report this issue."
+            )
+        }
+
+        return usage
+    }
+
+    private func fetchUsageAPI(apiKey: String) async throws -> OpenCodeGoDashboardUsage {
+        var request = URLRequest(url: usageURL)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let data = try await fetchData(request: request)
+        return try Self.parseUsageAPIJSON(data)
+    }
+
+    private static func parseAPIWindow(_ value: Any?, now: Date) -> OpenCodeGoUsageWindow? {
+        guard let dict = value as? [String: Any],
+              let percent = numberAsDouble(dict["percent"]) else {
+            return nil
+        }
+
+        let resetDate: Date
+        let resetInSeconds: Int
+        if let resetsAtString = dict["resetsAt"] as? String,
+           let resetsAt = parseISO8601(resetsAtString) {
+            resetDate = resetsAt
+            resetInSeconds = max(0, Int(resetsAt.timeIntervalSince(now).rounded()))
+        } else {
+            return nil
+        }
+
+        return OpenCodeGoUsageWindow(
+            usagePercent: percent,
+            resetInSeconds: resetInSeconds,
+            resetDate: resetDate
+        )
+    }
+
+    private static func numberAsDouble(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String {
+            return Double(string)
+        }
+        return nil
+    }
+
+    private static func parseISO8601(_ string: String) -> Date? {
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFractional.date(from: string) {
+            return date
+        }
+        let withoutFractional = ISO8601DateFormatter()
+        withoutFractional.formatOptions = [.withInternetDateTime]
+        return withoutFractional.date(from: string)
     }
 
     private func fetchModelCount(apiKey: String) async throws -> Int {
